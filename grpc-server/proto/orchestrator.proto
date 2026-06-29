@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package orchestrator.v1;
 
-option go_package = "grpc-server/proto/v1;orchestratorv1";
+option go_package = "grpc-server/proto;orchestratorv1";
 
 // Orchestrator — kontrol job scraping dari VPS Scraper
 service Orchestrator {

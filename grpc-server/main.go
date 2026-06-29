@@ -9,10 +9,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
-	pb "grpc-server/proto/v1"
+	pb "grpc-server/proto"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"google.golang.org/grpc"
@@ -77,11 +78,12 @@ func (s *JobStore) list(filter pb.JobStatus) []*Job {
 
 type orchestratorServer struct {
 	pb.UnimplementedOrchestratorServer
-	startTime  time.Time
-	store      *JobStore
-	mqttClient mqtt.Client
-	browserURL string
-	httpClient *http.Client
+	startTime     time.Time
+	store         *JobStore
+	mqttClient    mqtt.Client
+	browserURL    string
+	browserAPIKey string // Bearer token untuk browser REST API (Phase 5)
+	httpClient    *http.Client
 }
 
 func (s *orchestratorServer) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
@@ -172,8 +174,29 @@ func (s *orchestratorServer) CancelJob(_ context.Context, req *pb.CancelJobReque
 }
 
 // ─────────────────────────────────────────────
-// Job execution — panggil full-tool-browser REST API
+// Job execution — panggil full-tool-browser Scraper API (Phase 3+)
 // ─────────────────────────────────────────────
+
+// platformName mengonversi proto enum ke string platform scraper.
+// PLATFORM_INSTAGRAM → "instagram", dll.
+func platformName(p pb.Platform) string {
+	raw := p.String()                            // "PLATFORM_INSTAGRAM"
+	raw = strings.TrimPrefix(raw, "PLATFORM_")   // "INSTAGRAM"
+	return strings.ToLower(raw)                  // "instagram"
+}
+
+// browserDo membuat HTTP request ke browser VPS dengan API key header.
+func (s *orchestratorServer) browserDo(method, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(method, s.browserURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if s.browserAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+s.browserAPIKey)
+	}
+	return s.httpClient.Do(req)
+}
 
 func (s *orchestratorServer) executeJob(job *Job) {
 	s.updateJobStatus(job, pb.JobStatus_JOB_STATUS_RUNNING, "")
@@ -183,49 +206,117 @@ func (s *orchestratorServer) executeJob(job *Job) {
 		profile = "openclaw"
 	}
 
+	// ── 1. Submit ke browser scraper API ──────────────────────────────
 	payload, _ := json.Marshal(map[string]any{
-		"action":  "navigate",
-		"profile": profile,
-		"url":     job.URL,
+		"platform":    platformName(job.Platform),
+		"targetUrl":   job.URL,
+		"profileName": profile,
 	})
 
-	resp, err := s.httpClient.Post(
-		s.browserURL+"/browser/request",
-		"application/json",
-		bytes.NewReader(payload),
-	)
+	resp, err := s.browserDo(http.MethodPost, "/scraper/jobs", payload)
 	if err != nil {
-		slog.Error("browser request failed", "job", job.ID, "error", err)
-		s.updateJobStatus(job, pb.JobStatus_JOB_STATUS_FAILED, err.Error())
+		s.failJob(job, "submit ke browser gagal: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	var result map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		s.updateJobStatus(job, pb.JobStatus_JOB_STATUS_FAILED, "decode error: "+err.Error())
+	var submitResp struct {
+		OK  bool `json:"ok"`
+		Job struct {
+			ID string `json:"id"`
+		} `json:"job"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
+		s.failJob(job, "decode submit response: "+err.Error())
+		return
+	}
+	if !submitResp.OK {
+		s.failJob(job, "browser menolak job: "+submitResp.Error)
 		return
 	}
 
-	resultJSON, _ := json.Marshal(map[string]any{
-		"job_id":    job.ID,
-		"platform":  job.Platform.String(),
-		"url":       job.URL,
-		"result":    result,
-		"timestamp": time.Now().Unix(),
-	})
+	browserJobID := submitResp.Job.ID
+	slog.Info("browser job submitted", "grpcJob", job.ID, "browserJob", browserJobID)
 
-	if s.mqttClient != nil && s.mqttClient.IsConnected() {
-		token := s.mqttClient.Publish(job.MQTTTopic, 1, false, resultJSON)
-		token.Wait()
-		if err := token.Error(); err != nil {
-			slog.Warn("mqtt publish failed", "topic", job.MQTTTopic, "error", err)
-		} else {
-			slog.Info("result published", "topic", job.MQTTTopic)
+	// ── 2. Poll sampai selesai (max 5 menit, interval 5 detik) ────────
+	const maxWait      = 5 * time.Minute
+	const pollInterval = 5 * time.Second
+	deadline := time.Now().Add(maxWait)
+
+	var finalData map[string]any
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+
+		pollResp, err := s.browserDo(http.MethodGet, "/scraper/jobs/"+browserJobID, nil)
+		if err != nil {
+			slog.Warn("poll error", "grpcJob", job.ID, "error", err)
+			continue
+		}
+
+		var pollData map[string]any
+		json.NewDecoder(pollResp.Body).Decode(&pollData)
+		pollResp.Body.Close()
+
+		jobObj, _ := pollData["job"].(map[string]any)
+		jobStatus, _ := jobObj["status"].(string)
+
+		switch jobStatus {
+		case "done":
+			finalData = pollData
+		case "failed":
+			errMsg, _ := jobObj["error"].(string)
+			s.failJob(job, "scraper gagal: "+errMsg)
+			return
+		}
+
+		if finalData != nil {
+			break
 		}
 	}
 
+	if finalData == nil {
+		s.failJob(job, fmt.Sprintf("timeout setelah %s menunggu browser job %s", maxWait, browserJobID))
+		return
+	}
+
+	// ── 3. Publish hasil ke MQTT ──────────────────────────────────────
+	s.publishResult(job, map[string]any{
+		"job_id":         job.ID,
+		"browser_job_id": browserJobID,
+		"platform":       platformName(job.Platform),
+		"url":            job.URL,
+		"result":         finalData,
+		"timestamp":      time.Now().Unix(),
+	})
+
 	s.updateJobStatus(job, pb.JobStatus_JOB_STATUS_DONE, "")
+}
+
+func (s *orchestratorServer) failJob(job *Job, msg string) {
+	slog.Error("job gagal", "id", job.ID, "error", msg)
+	s.updateJobStatus(job, pb.JobStatus_JOB_STATUS_FAILED, msg)
+	s.publishResult(job, map[string]any{
+		"job_id":    job.ID,
+		"platform":  platformName(job.Platform),
+		"status":    "failed",
+		"error":     msg,
+		"timestamp": time.Now().Unix(),
+	})
+}
+
+func (s *orchestratorServer) publishResult(job *Job, payload map[string]any) {
+	if s.mqttClient == nil || !s.mqttClient.IsConnected() {
+		return
+	}
+	data, _ := json.Marshal(payload)
+	token := s.mqttClient.Publish(job.MQTTTopic, 1, false, data)
+	token.Wait()
+	if err := token.Error(); err != nil {
+		slog.Warn("mqtt publish gagal", "topic", job.MQTTTopic, "error", err)
+	} else {
+		slog.Info("result published", "topic", job.MQTTTopic)
+	}
 }
 
 func (s *orchestratorServer) updateJobStatus(job *Job, st pb.JobStatus, errMsg string) {
@@ -279,24 +370,27 @@ func newMQTTClient(broker, user, pass string) mqtt.Client {
 // ─────────────────────────────────────────────
 
 func main() {
-	grpcPort := getenv("GRPC_PORT", "9090")
-	browserURL := getenv("BROWSER_URL", "http://10.10.0.2:8080")
-	mqttBroker := getenv("MQTT_BROKER", "tcp://mosquitto:1883")
-	mqttUser := getenv("MQTT_USERNAME", "browser-agent")
-	mqttPass := os.Getenv("MQTT_PASSWORD")
+	grpcPort      := getenv("GRPC_PORT", "9090")
+	browserURL    := getenv("BROWSER_URL", "http://10.10.0.2:8080")
+	browserAPIKey := os.Getenv("BROWSER_API_KEY") // Bearer token Phase 5
+	mqttBroker    := getenv("MQTT_BROKER", "tcp://mosquitto:1883")
+	mqttUser      := getenv("MQTT_USERNAME", "browser-agent")
+	mqttPass      := os.Getenv("MQTT_PASSWORD")
 
 	slog.Info("starting orchestrator",
 		"grpc_port", grpcPort,
 		"browser_url", browserURL,
 		"mqtt_broker", mqttBroker,
+		"browser_auth", browserAPIKey != "",
 	)
 
 	srv := &orchestratorServer{
-		startTime:  time.Now(),
-		store:      newJobStore(),
-		mqttClient: newMQTTClient(mqttBroker, mqttUser, mqttPass),
-		browserURL: browserURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		startTime:     time.Now(),
+		store:         newJobStore(),
+		mqttClient:    newMQTTClient(mqttBroker, mqttUser, mqttPass),
+		browserURL:    browserURL,
+		browserAPIKey: browserAPIKey,
+		httpClient:    &http.Client{Timeout: 10 * time.Minute}, // perlu tunggu scraping selesai
 	}
 
 	lis, err := net.Listen("tcp", ":"+grpcPort)
