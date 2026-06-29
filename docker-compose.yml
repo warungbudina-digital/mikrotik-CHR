@@ -1,4 +1,9 @@
 services:
+
+  # ────────────────────────────────────────────
+  # MikroTik RouterOS CHR
+  # RAM: ~256–512MB | CPU: 0.8 core
+  # ────────────────────────────────────────────
   routeros:
     image: dharma007/mikrotik-cloud
     container_name: mikrotik-chr
@@ -15,12 +20,21 @@ services:
       - "2222:22"
       - "2223:23"
       - "7777:80"
-      - "8728:8728"
-      - "8729:8729"
-      - "8291:8291"
     networks:
-      - mikrotik-net
+      mikrotik-net:
+        ipv4_address: 172.20.0.2
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.8"
+        reservations:
+          memory: 256m
 
+  # ────────────────────────────────────────────
+  # Nginx — proxy WebFig, REST API, gRPC
+  # RAM: ~32–64MB | CPU: 0.2 core
+  # ────────────────────────────────────────────
   router-proxy:
     image: nginx:alpine
     container_name: router-proxy
@@ -30,12 +44,29 @@ services:
     ports:
       - "8080:8080"
       - "8081:8081"
+      - "8291:8291"
+      - "8728:8728"
+      - "8729:8729"
       - "19090:19090"
+      - "50051:50051"
     networks:
-      - mikrotik-net
+      mikrotik-net:
+        ipv4_address: 172.20.0.3
     depends_on:
       - routeros
+      - grpc-server
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.2"
+        reservations:
+          memory: 32m
 
+  # ────────────────────────────────────────────
+  # Cloudflare Tunnel — akses HTTPS tanpa buka firewall
+  # RAM: ~64–128MB | CPU: 0.2 core
+  # ────────────────────────────────────────────
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared-tunnel
@@ -44,11 +75,154 @@ services:
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
-      - mikrotik-net
+      mikrotik-net:
+        ipv4_address: 172.20.0.4
     depends_on:
       - router-proxy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.2"
+        reservations:
+          memory: 64m
 
+  # ────────────────────────────────────────────
+  # Unbound — recursive DNS resolver
+  # Upstream dari PiHole, tidak butuh expose ke host
+  # RAM: ~64–128MB | CPU: 0.1 core
+  # ────────────────────────────────────────────
+  unbound:
+    image: mvance/unbound:latest
+    container_name: unbound
+    restart: unless-stopped
+    volumes:
+      - ./unbound/unbound.conf:/opt/unbound/etc/unbound/unbound.conf:ro
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.20.0.5
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.1"
+        reservations:
+          memory: 64m
+
+  # ────────────────────────────────────────────
+  # PiHole — DNS filter + ad/tracking blocker
+  # DNS dari WireGuard → host:53 → pihole (via iptables DNAT)
+  # RAM: ~128–256MB | CPU: 0.2 core
+  # ────────────────────────────────────────────
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Jakarta
+      WEBPASSWORD: ${PIHOLE_PASSWORD}
+      PIHOLE_DNS_1: 172.20.0.5#5335          # Unbound
+      PIHOLE_DNS_2: 1.1.1.1                  # Fallback Cloudflare
+      DNSMASQ_LISTENING: all
+      FTLCONF_LOCAL_IPV4: 172.20.0.6
+      REV_SERVER: "false"
+      DNSSEC: "true"
+    volumes:
+      - pihole-data:/etc/pihole
+      - pihole-dnsmasq:/etc/dnsmasq.d
+    # Port 53 TIDAK di-expose ke host — traffic DNS dari WireGuard
+    # di-DNAT oleh iptables (PostUp di wg0.conf) ke 172.20.0.6:53
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.20.0.6
+    depends_on:
+      - unbound
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.2"
+        reservations:
+          memory: 128m
+
+  # ────────────────────────────────────────────
+  # Mosquitto — MQTT broker
+  # Port 1883: plain MQTT (dalam WireGuard tunnel = aman)
+  # Port 9001: WebSocket
+  # RAM: ~32–64MB | CPU: 0.1 core
+  # ────────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    ports:
+      - "127.0.0.1:1883:1883"     # hanya dari localhost / WireGuard
+      - "127.0.0.1:9001:9001"
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.20.0.7
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.1"
+        reservations:
+          memory: 32m
+
+  # ────────────────────────────────────────────
+  # gRPC Orchestrator — Go service
+  # Menerima job dari VPS Scraper, forward ke browser API,
+  # publish hasil ke MQTT
+  # RAM: ~64–128MB | CPU: 0.2 core
+  # ────────────────────────────────────────────
+  grpc-server:
+    build:
+      context: ./grpc-server
+      dockerfile: Dockerfile
+    container_name: grpc-orchestrator
+    restart: unless-stopped
+    environment:
+      GRPC_PORT: "9090"
+      BROWSER_URL: "http://10.10.0.2:8080"   # VPS Scraper via WireGuard
+      MQTT_BROKER: "tcp://mosquitto:1883"
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      TZ: Asia/Jakarta
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.20.0.8
+    depends_on:
+      - mosquitto
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.2"
+        reservations:
+          memory: 64m
+
+# ────────────────────────────────────────────
+# Network — subnet fixed agar iptables DNAT reliable
+# ────────────────────────────────────────────
 networks:
   mikrotik-net:
     name: mikrotik-net
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+# ────────────────────────────────────────────
+# Volumes
+# ────────────────────────────────────────────
+volumes:
+  pihole-data:
+  pihole-dnsmasq:
+  mosquitto-data:
+  mosquitto-log:

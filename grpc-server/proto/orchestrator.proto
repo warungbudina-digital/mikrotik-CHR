@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package orchestrator.v1;
+
+option go_package = "grpc-server/proto/v1;orchestratorv1";
+
+// Orchestrator — kontrol job scraping dari VPS Scraper
+service Orchestrator {
+  // Health check
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Submit job scraping baru
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Cek status job
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+
+  // List semua job
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  // Batalkan job yang sedang berjalan
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_INSTAGRAM   = 1;
+  PLATFORM_TIKTOK      = 2;
+  PLATFORM_TWITTER     = 3;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_PENDING     = 1;
+  JOB_STATUS_RUNNING     = 2;
+  JOB_STATUS_DONE        = 3;
+  JOB_STATUS_FAILED      = 4;
+  JOB_STATUS_CANCELLED   = 5;
+}
+
+// ─────────────────────────────────────────────
+// Messages
+// ─────────────────────────────────────────────
+
+message PingRequest {}
+message PingResponse {
+  string version = 1;
+  int64  uptime_seconds = 2;
+}
+
+message SubmitJobRequest {
+  Platform            platform       = 1;
+  string              url            = 2;
+  string              browser_profile = 3;          // profile name di full-tool-browser
+  map<string, string> options        = 4;            // opsi tambahan (limit, depth, dll)
+}
+
+message SubmitJobResponse {
+  string    job_id      = 1;
+  JobStatus status      = 2;
+  string    mqtt_topic  = 3;  // topic MQTT untuk subscribe hasil
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  string    job_id      = 1;
+  JobStatus status      = 2;
+  string    mqtt_topic  = 3;
+  string    error       = 4;
+  int64     created_at  = 5;  // unix timestamp
+  int64     updated_at  = 6;
+}
+
+message ListJobsRequest {
+  JobStatus filter_status = 1;  // 0 = semua
+  int32     limit         = 2;  // 0 = default 50
+}
+
+message ListJobsResponse {
+  repeated GetJobResponse jobs  = 1;
+  int32                   total = 2;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  string    job_id  = 1;
+  JobStatus status  = 2;
+}
