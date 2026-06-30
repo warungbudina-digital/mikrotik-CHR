@@ -98,6 +98,13 @@ services:
     restart: unless-stopped
     volumes:
       - ./unbound/unbound.conf:/opt/unbound/etc/unbound/unbound.conf:ro
+      - ./unbound/root.hints:/opt/unbound/etc/unbound/root.hints:ro
+    healthcheck:
+      test: ["CMD-SHELL", "drill @127.0.0.1 -p 5335 cloudflare.com || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
     networks:
       mikrotik-net:
         ipv4_address: 172.20.0.5
