@@ -194,12 +194,13 @@ services:
     container_name: grpc-orchestrator
     restart: unless-stopped
     environment:
+      BROWSER_API_KEY: "1b55df6c632a86f172ebc3c9a229c382ebdb9737e48d137b3d0325e460123331"
       GRPC_PORT: "9090"
       BROWSER_URL: "http://10.10.0.2:8080"   # VPS Scraper via WireGuard
       MQTT_BROKER: "tcp://mosquitto:1883"
       MQTT_USERNAME: ${MQTT_USERNAME}
       MQTT_PASSWORD: ${MQTT_PASSWORD}
-      TZ: Asia/Jakarta
+      TZ: Asia/Makassar
     networks:
       mikrotik-net:
         ipv4_address: 172.20.0.8
