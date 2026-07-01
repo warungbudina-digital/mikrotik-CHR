@@ -170,26 +170,11 @@ fi
 # ─────────────────────────────────────────────
 header "WireGuard Setup (Host)"
 
-WG_CONF="/etc/wireguard/wg0.conf"
-
-if systemctl is-active --quiet wg-quick@wg0 2>/dev/null; then
-  ok "WireGuard wg0 sudah berjalan — skip"
-  wg show wg0 2>/dev/null | head -6 || true
-else
-  if [[ -f "$WG_CONF" ]] && ! grep -q "REPLACE_WITH" "$WG_CONF" 2>/dev/null; then
-    info "wg0.conf sudah dikonfigurasi, start service..."
-    systemctl enable --now wg-quick@wg0
-    ok "WireGuard dimulai"
-  else
-    info "Menjalankan wireguard/setup-chr.sh..."
-    bash "$REPO_DIR/wireguard/setup-chr.sh"
-  fi
-fi
-
-# Simpan iptables rules
-if command -v netfilter-persistent &>/dev/null; then
-  netfilter-persistent save -q 2>/dev/null && ok "iptables rules disimpan (persistent)" || warn "netfilter-persistent save gagal — rules tidak persisten setelah reboot"
-fi
+# wireguard/setup.sh sudah idempotent — skip sendiri (tanpa prompt) kalau wg0
+# sudah aktif & terkonfigurasi, jadi aman dipanggil tiap kali installer ini jalan.
+info "Menjalankan wireguard/setup.sh..."
+bash "$REPO_DIR/wireguard/setup.sh"
+# (wireguard/setup.sh sudah handle systemctl enable + netfilter-persistent save sendiri)
 
 # ─────────────────────────────────────────────
 # [5] Docker Compose — Build & Up
@@ -276,7 +261,7 @@ echo ""
 echo -e "  ${BOLD}Langkah selanjutnya${NC}"
 echo "    1. Buka port 51820/UDP di firewall VPS (UFW: ufw allow 51820/udp)"
 echo "    2. Catat WireGuard Public Key CHR di atas"
-echo "    3. Jalankan setup di VPS Scraper: bash wireguard/setup-scraper.sh"
+echo "    3. Jalankan setup di VPS Scraper: sudo bash setup.sh (repo full-tool-browser)"
 echo "    4. Tambahkan Public Key VPS Scraper ke /etc/wireguard/wg0.conf [Peer]"
 echo "    5. wg addconf wg0 <(wg-quick strip wg0) untuk reload peer tanpa downtime"
 echo ""
